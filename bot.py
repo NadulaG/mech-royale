@@ -382,6 +382,10 @@ class Bot:
             s = d + e.hp / 6.0 + (0 if vis else 150)
             if e.charging:
                 s -= 40
+                if self.aimed_at_me(e):
+                    s -= 150
+            if "laser" in (e.weapons or []):
+                s -= 25
             if s < bs:
                 bs, best = s, e
         return best
@@ -584,6 +588,11 @@ class Bot:
         threat_n = len([e for e in enemies if math.dist(e.pos, self.pos) < 220])
         tgt = self.target
         if dest is None and enemies:
+            duck = self.laser_duck(enemies, zc, zr)
+            if duck is not None:
+                self.mode = "duck"
+                move, b2, jump = self.steer(duck, 1.0, obs, direct=True)
+                return move, me["energy"] > 15, jump
             strong = sum(e.hp for e in enemies if math.dist(e.pos, self.pos) < 200)
             lone = threat_n <= 1
             if tgt is not None and ((lone and (hpf > 0.35 or tgt.hp < me["hp"])) or (threat_n == 2 and me["hp"] > strong * 0.8)):
@@ -618,6 +627,30 @@ class Bot:
             return (0.0, 0.0)
         return (x / n, y / n)
 
+    def aimed_at_me(self, e, tol=0.16):
+        px, py, pz = self.pos
+        b = math.atan2(py - e.pos[1], px - e.pos[0])
+        return abs(wrap(b - e.aim[0])) < tol
+
+    def laser_duck(self, enemies, zc, zr):
+        """An enemy is charging a laser at us and we can't answer: step behind cover if it's close."""
+        th = [e for e in enemies if e.charging and self.aimed_at_me(e)]
+        if not th:
+            return None
+        lw = next((w for w in self.me["weapons"] if w and w["kind"] == "laser"), None)
+        if lw is not None and (lw.get("charge", 0) >= 0.35 or lw["cooldown"] < 0.2):
+            return None  # duel it
+        srcs = [[e.pos[0], e.pos[1], e.pos[2] + 8] for e in th]
+        self.cover_t = -99
+        c = self.cover_point_from(srcs, zc, zr)
+        px, py, pz = self.pos
+        if c is None or hyp(c[0] - px, c[1] - py) > 20:
+            return None
+        gz = self.surf(c[0], c[1])
+        if all(not self.los(sp, [c[0], c[1], gz + 5]) for sp in srcs):
+            return c
+        return None
+
     def fight_move(self, tgt, zc, zr):
         me = self.me
         t = self.t
@@ -644,9 +677,11 @@ class Bot:
             self.strafe = -self.strafe
             self.strafe_until = t + self.rng.uniform(0.3, 0.6)
         ux, uy = (ex - px) / max(d, 1e-6), (ey - py) / max(d, 1e-6)
-        radial = clamp((d - want) / 25.0, -1.0, 1.0)
+        kite = "lightning" in tw and "lightning" not in kinds and d < 60
+        radial = clamp((d - want) / (12.0 if kite else 25.0), -1.0, 1.0)
         tx, ty = -uy * self.strafe, ux * self.strafe
-        mx, my = ux * radial + tx * 0.9, uy * radial + ty * 0.9
+        tw_ = 0.9 * (1 - 0.6 * abs(radial)) if kite else 0.9
+        mx, my = ux * radial + tx * tw_, uy * radial + ty * tw_
         # keep inside the safe circle
         dzc = hyp(px - zc[0], py - zc[1])
         if dzc > zr * 0.8:
@@ -656,7 +691,7 @@ class Bot:
         dest = (px + mv[0] * 12, py + mv[1] * 12)
         move, boost, jump = self.steer(dest, 1.0, None, direct=True)
         jump = jump or (tgt.charging and me["grounded"] and self.rng.random() < 0.3)
-        boost = boost or (me["energy"] > 60 and d < want - 20)
+        boost = boost or (me["energy"] > 60 and d < want - 20) or (kite and me["energy"] > 20)
         dm = self.dodge(None)
         if dm is not None:
             move = self.norm2(move[0] * 0.5 + dm[0], move[1] * 0.5 + dm[1])
@@ -806,8 +841,27 @@ class Bot:
                 bs, best, why = s, (p[0], p[1], p[2]), "drop"
         if best is not None and bs > -60:
             return (best[0], best[1]), why
-        # hold position: inside the *next* circle, toward its center
+        # explore for a better weapon early on
         z = obs["zone"]
+        if self.wk[1] != "laser" and t < 200 and z["next_radius"] > 60:
+            ex = getattr(self, "explore", None)
+            if ex is None or hyp(ex[0] - px, ex[1] - py) < 12 or t > self.explore_until:
+                ex = None
+                for _ in range(12):
+                    a = self.rng.uniform(-PI, PI)
+                    r = self.rng.uniform(70, 150)
+                    cx, cy = px + math.cos(a) * r, py + math.sin(a) * r
+                    nc = z["next_center"]
+                    if hyp(cx - nc[0], cy - nc[1]) < z["next_radius"] * 0.8 and (self.world is None or self.world.inside_bounds(cx, cy, 20)):
+                        ex = (cx, cy)
+                        break
+                if ex is None:
+                    nc = z["next_center"]
+                    ex = (nc[0], nc[1])
+                self.explore = ex
+                self.explore_until = t + 25
+            return ex, "explore"
+        # hold position: inside the *next* circle, toward its center
         zc, zr = z["next_center"], z["next_radius"]
         dzc = hyp(px - zc[0], py - zc[1])
         hold_r = zr * 0.45

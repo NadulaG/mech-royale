@@ -66,8 +66,10 @@ async def run_match(args, sid, room, code, n):
                     continue
                 if m.get("type") == "ready":
                     continue
-                m.pop("debug", None)
+                dbg = m.pop("debug", None)
                 await ws.send(json.dumps(m, separators=(",", ":")))
+                rec.write(json.dumps({"type": "act", "tick": m.get("tick"), "a": {k: v for k, v in m.items() if k != "tick"},
+                                      "label": (dbg or {}).get("label")}, separators=(",", ":")) + "\n")
 
         pump = None
         async for raw in ws:
