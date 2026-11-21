@@ -754,7 +754,7 @@ class Bot:
         px, py, pz = self.pos
         if self.cover is not None and t - self.cover_t < 0.6:
             return self.cover
-        if time.perf_counter() - self.t0 > 0.02:
+        if time.perf_counter() - self.t0 > 0.014:
             return self.cover or (px, py)
         best, bs = None, -1e18
         cx = sum(s[0] for s in srcs) / len(srcs)
@@ -787,7 +787,7 @@ class Bot:
                         s -= 12
                 if s > bs:
                     bs, best = s, (x, y)
-            if time.perf_counter() - self.t0 > 0.025:
+            if time.perf_counter() - self.t0 > 0.016:
                 break
         self.cover = best or (px, py)
         self.cover_t = t
@@ -942,9 +942,9 @@ class Bot:
             self.path_t = t
             self.pending_goal = dest
         if nav.job is not None:
-            left = 0.038 - (time.perf_counter() - self.t0)
+            left = 0.022 - (time.perf_counter() - self.t0)
             if left > 0.004:
-                p = nav.step(min(0.012, left - 0.003))
+                p = nav.step(min(0.008, left - 0.002))
                 if p is not None:
                     self.path = p
                     self.path_goal = self.pending_goal
