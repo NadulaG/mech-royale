@@ -806,9 +806,11 @@ class Bot:
                 bs, best, why = s, (p[0], p[1], p[2]), "drop"
         if best is not None and bs > -60:
             return (best[0], best[1]), why
-        # hold position: inside safe circle toward its center
+        # hold position: inside the *next* circle, toward its center
+        z = obs["zone"]
+        zc, zr = z["next_center"], z["next_radius"]
         dzc = hyp(px - zc[0], py - zc[1])
-        hold_r = zr * 0.35
+        hold_r = zr * 0.45
         if dzc > hold_r and dzc > 1:
             return (zc[0] + (px - zc[0]) / dzc * hold_r, zc[1] + (py - zc[1]) / dzc * hold_r), "hold"
         return (px, py), "hold"
