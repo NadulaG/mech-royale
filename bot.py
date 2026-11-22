@@ -65,6 +65,7 @@ class Track:
 
 class Bot:
     name = "ohio-steel"
+    HEAL_BELOW = 0.8
 
     def __init__(self, hello):
         self.cfg = cfg = hello["config"]
@@ -152,6 +153,8 @@ class Bot:
         # -------- loot interaction (take weapons)
         self.handle_take(obs, act)
 
+        hpf = me["hp"] / max(1.0, me["max_hp"])
+        self.healing = hpf < self.HEAL_BELOW and not enemies
         # -------- combat: choose target and aim/fire
         aim, fire, extra = self.combat(obs, enemies)
 
@@ -422,8 +425,15 @@ class Bot:
             tp, tvel, kind_t, tgt_obj = self.target_point(tgt), tgt.vel, "mech", tgt
         d = math.dist(mz, tp)
         visible = self.los(mz, tp)
-        if not visible and kind_t != "crate":
-            visible = self.los(mz, [tp[0], tp[1], tp[2] + 3.0])
+        if not visible and kind_t == "mech":
+            # aim at whatever part of the body is exposed (over a wall: upper torso; under an overhang: legs)
+            sc = 1 + 0.05 * (getattr(tgt_obj, "cubes", 0) or 0)
+            for dz in (2.8 * sc, 3.8 * sc, -2.8 * sc, 1.5 * sc):
+                cand = [tp[0], tp[1], tp[2] + dz]
+                if self.los(mz, cand):
+                    tp = cand
+                    visible = True
+                    break
         ground = None
         if self.world is not None:
             ground = self.world.surface_below(tp[0], tp[1], tp[2] - 4) + 0.5
@@ -460,14 +470,14 @@ class Bot:
                     aim = self.aim_at(mz, lp)
                     ey, ep = self.aim_err(aim)
                     tol = math.atan2(1.6, max(d, 1))
-                    if ch >= full - 0.02 and ey < tol + 0.03 and ep < tol + 0.03:
+                    if ch >= full - 0.02 and ey < tol + 0.006 and ep < tol + 0.006:
                         fire[laser_slot] = False  # release
                     else:
                         fire[laser_slot] = True
                 else:
                     fire[laser_slot] = True  # keep charging
             else:
-                if lw["cooldown"] <= 0.05 and in_range and (visible or d < 120) and kind_t in ("mech", "npc"):
+                if lw["cooldown"] <= 0.05 and in_range and visible and kind_t in ("mech", "npc"):
                     fire[laser_slot] = True  # start charge
 
         # lightning
@@ -496,6 +506,8 @@ class Bot:
     def farm_target(self, obs):
         """NPCs and crates to shoot when no enemy mech is visible."""
         t = self.t
+        if self.healing:
+            return None
         if t - max((e.seen_t for e in self.enemies.values()), default=-99) < 3.0:
             return None
         mz = self.muzzle()
@@ -595,7 +607,7 @@ class Bot:
                 return move, me["energy"] > 15, jump
             strong = sum(e.hp for e in enemies if math.dist(e.pos, self.pos) < 200)
             lone = threat_n <= 1
-            if tgt is not None and ((lone and (hpf > 0.35 or tgt.hp < me["hp"])) or (threat_n == 2 and me["hp"] > strong * 0.8)):
+            if tgt is not None and ((lone and (hpf > 0.6 or me["hp"] >= 0.55 * tgt.hp)) or (threat_n == 2 and me["hp"] > strong * 0.8)):
                 self.mode = "fight"
                 return self.fight_move(tgt, zc, zr)
             self.mode = "evade"
@@ -608,6 +620,11 @@ class Bot:
             fake = [px + math.cos(b) * 100, py + math.sin(b) * 100, pz]
             dest = self.cover_point_from([fake], zc, zr)
             boost = me["energy"] > 40
+        if dest is None and self.healing:
+            dest = self.heal_spot(obs, zc, zr)
+            if dest is not None:
+                self.mode = "heal"
+                speed = 1.0 if hyp(dest[0] - px, dest[1] - py) > 4 else 0.0
         if dest is None:
             dest, why = self.loot_or_hold(obs, zc, zr)
             self.mode = why
@@ -792,6 +809,28 @@ class Bot:
         self.cover = best or (px, py)
         self.cover_t = t
         return self.cover
+
+    def heal_spot(self, obs, zc, zr):
+        """Stand still out of sight of recently seen enemies (and threat bearings) while HP regenerates."""
+        t = self.t
+        px, py, pz = self.pos
+        # grab cubes that are very close first
+        for k, (cat, kind, p, st, hp) in self.items.items():
+            if cat == "cubes" and hyp(p[0] - px, p[1] - py) < 25 and abs(p[2] - pz) < 6:
+                return None
+        srcs = [[e.pos[0], e.pos[1], e.pos[2] + 8] for e in self.enemies.values() if t - e.seen_t < 20]
+        for tt, b, by, wpn, amt in self.threats:
+            if t - tt < 6 and by is not None and by not in self.enemies:
+                srcs.append([px + math.cos(b) * 80, py + math.sin(b) * 80, pz + 8])
+        if not srcs:
+            return (px, py)
+        eye = [px, py, pz + 6]
+        if all(not self.los(sp, eye) for sp in srcs):
+            return (px, py)  # already hidden: stay still and silent
+        if self.cover is not None and t - self.cover_t < 1.5:
+            return self.cover
+        self.cover_t = -99
+        return self.cover_point_from(srcs, zc, zr)
 
     def loot_or_hold(self, obs, zc, zr):
         t = self.t
