@@ -66,8 +66,10 @@ class Track:
 class Bot:
     name = "ohio-steel"
     HEAL_BELOW = 0.8
-    STEALTH = True        # stay silent and hidden; only fight when engaged
+    STEALTH = False       # stay silent and hidden; only fight when engaged
     SILENT_SPEED = 4.5    # m/s, below sound.step_speed
+    FARM = True           # actively seek NPC drones and crates for cubes
+    HUNT = True           # walk toward combat sounds when healthy and idle
 
     def __init__(self, hello):
         self.cfg = cfg = hello["config"]
@@ -201,6 +203,11 @@ class Bot:
         for d in (self.enemies, self.npcs):
             for k in [k for k, v in d.items() if t - v.seen_t > 30]:
                 del d[k]
+        seen_npc = {m["id"] for m in obs["mechs"] if m["kind"] != "mech"}
+        px0, py0, pz0 = self.pos
+        for k in [k for k, v in self.npcs.items() if k not in seen_npc and t - v.seen_t > 1.0
+                  and hyp(v.pos[0] - px0, v.pos[1] - py0) < 40]:
+            del self.npcs[k]
         listed = set()
         for cat in ("pickups", "crates", "cubes"):
             for it in obs.get(cat, []):
@@ -596,7 +603,7 @@ class Bot:
         # zone-forced
         margin = min(25.0, zr * 0.25)
         zone_bad = dz > zr - margin
-        if out_now or (zone_bad and urg > 0):
+        if out_now or (zone_bad and urg > 0 and (not enemies or urg > 15)):
             self.mode = "rotate"
             inner = max(0.0, zr * 0.55)
             if dz > 1e-6:
@@ -1006,6 +1013,41 @@ class Bot:
                 continue
             if s > bs:
                 bs, best, why = s, p, tag
+        # farm NPC drones and crates for cubes
+        hpf = self.me["hp"] / max(1.0, self.me["max_hp"])
+        if self.FARM and not self.healing and hpf > 0.5:
+            for n in self.npcs.values():
+                if t - n.seen_t > 25:
+                    continue
+                p = n.pos
+                if not in_safe(p):
+                    continue
+                d = hyp(p[0] - px, p[1] - py)
+                if d > 260:
+                    continue
+                s_ = 80 - d * 0.5
+                if s_ > bs:
+                    vis = t - n.seen_t < 0.3
+                    if vis and d < 65:
+                        tgtp = (px, py, pz)
+                    else:
+                        k_ = max(0.0, (d - 45) / max(d, 1))
+                        tgtp = (px + (p[0] - px) * k_, py + (p[1] - py) * k_, p[2])
+                    bs, best, why = s_, tgtp, "farm:npc"
+            for k, (cat, kind, p, st, hp) in self.items.items():
+                if cat != "crates" or not in_safe(p):
+                    continue
+                d = hyp(p[0] - px, p[1] - py)
+                if d > 200 or p[2] - pz > 25:
+                    continue
+                s_ = 55 - d * 0.5
+                if s_ > bs:
+                    if d < 70 and t - st < 0.3:
+                        tgtp = (px, py, pz)
+                    else:
+                        k_ = max(0.0, (d - 30) / max(d, 1))
+                        tgtp = (px + (p[0] - px) * k_, py + (p[1] - py) * k_, p[2])
+                    bs, best, why = s_, tgtp, "farm:crate"
         # supply drops
         for dr in obs.get("drops", []):
             p = dr["pos"]
@@ -1026,7 +1068,16 @@ class Bot:
             return (best[0], best[1]), why
         # explore for a better weapon early on
         z = obs["zone"]
-        if self.wk[1] != "laser" and t < 200 and z["next_radius"] > 60:
+        # hunt toward recent combat sounds
+        if self.HUNT and hpf > 0.8 and t > 15 and not self.healing:
+            loud = [x for x in self.sounds if x[3] in ("gun", "laser", "lightning", "mortar", "explosion", "npc_gun", "crate") and t - x[0] < 6]
+            if loud:
+                st, b, dist, kind = loud[-1]
+                r = {"near": 40.0, "mid": 110.0}.get(dist, 220.0)
+                hx, hy = px + math.cos(b) * r, py + math.sin(b) * r
+                if in_safe((hx, hy)):
+                    return (hx, hy), "hunt"
+        if (self.wk[1] != "laser" or self.me["cubes"] < 10) and t < 240 and z["next_radius"] > 60:
             ex = getattr(self, "explore", None)
             if ex is None or hyp(ex[0] - px, ex[1] - py) < 12 or t > self.explore_until:
                 ex = None
