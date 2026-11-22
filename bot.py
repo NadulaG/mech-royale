@@ -66,6 +66,8 @@ class Track:
 class Bot:
     name = "ohio-steel"
     HEAL_BELOW = 0.8
+    STEALTH = True        # stay silent and hidden; only fight when engaged
+    SILENT_SPEED = 4.5    # m/s, below sound.step_speed
 
     def __init__(self, hello):
         self.cfg = cfg = hello["config"]
@@ -155,8 +157,13 @@ class Bot:
 
         hpf = me["hp"] / max(1.0, me["max_hp"])
         self.healing = hpf < self.HEAL_BELOW and not enemies
+        self.engaged = self.is_engaged(enemies)
         # -------- combat: choose target and aim/fire
         aim, fire, extra = self.combat(obs, enemies)
+        if self.STEALTH and not self.engaged:
+            lw = next((w for w in me["weapons"] if w and w["kind"] == "laser"), None)
+            if not (lw is not None and lw.get("charge", 0) > 0):
+                fire = [False, False]
 
         # -------- movement brain
         move, boost, jump = self.brain(obs, enemies, recent)
@@ -599,6 +606,12 @@ class Bot:
             boost = out_now or urg > 3 or dz > zr
         threat_n = len([e for e in enemies if math.dist(e.pos, self.pos) < 220])
         tgt = self.target
+        if dest is None and enemies and self.STEALTH and not self.engaged:
+            # seen them, they haven't engaged us: slip away out of sight, silently
+            self.mode = "lurk"
+            dest = self.cover_point(enemies, zc, zr)
+            move, b2, jump = self.steer(dest, self.silent_frac(), obs)
+            return move, False, False
         if dest is None and enemies:
             duck = self.laser_duck(enemies, zc, zr)
             if duck is not None:
@@ -624,7 +637,26 @@ class Bot:
             dest = self.heal_spot(obs, zc, zr)
             if dest is not None:
                 self.mode = "heal"
-                speed = 1.0 if hyp(dest[0] - px, dest[1] - py) > 4 else 0.0
+                speed = (self.silent_frac() if self.STEALTH else 1.0) if hyp(dest[0] - px, dest[1] - py) > 4 else 0.0
+        if dest is None and self.STEALTH:
+            ld, why = self.loot_or_hold(obs, zc, zr, stealth=True)
+            if ld is not None:
+                dest = ld
+                self.mode = why
+            else:
+                hs = self.hide_spot(obs)
+                if hs is not None:
+                    dest = hs
+                    self.mode = "hide"
+                    if hyp(hs[0] - px, hs[1] - py) < 2.0:
+                        dest = (px, py)
+            speed = self.silent_frac()
+            if dest is not None:
+                # if the zone needs us to hurry, walk/run normally
+                nc, nr = z["next_center"], z["next_radius"]
+                need = max(0.0, hyp(px - nc[0], py - nc[1]) - nr * 0.7)
+                if t + need / self.SILENT_SPEED + 12 > z["shrink_start"] and need > 0:
+                    speed = 1.0
         if dest is None:
             dest, why = self.loot_or_hold(obs, zc, zr)
             self.mode = why
@@ -638,11 +670,102 @@ class Bot:
             move = self.norm2(move[0] * 0.5 + dm[0], move[1] * 0.5 + dm[1])
         return move, boost, jump
 
+    def silent_frac(self):
+        return clamp(self.SILENT_SPEED / max(self.stats.get("walk_speed", 11.7), 1.0), 0.1, 1.0)
+
     def norm2(self, x, y):
         n = hyp(x, y)
         if n < 1e-9:
             return (0.0, 0.0)
         return (x / n, y / n)
+
+    def is_engaged(self, enemies):
+        if not self.STEALTH:
+            return True
+        t = self.t
+        if t - self.last_dmg_t < 5.0 or t - self.last_hit_t < 3.0:
+            return True
+        px, py, pz = self.pos
+        for e in enemies:
+            d = math.dist(e.pos, self.pos)
+            if d < 55:
+                return True
+            if e.charging and self.aimed_at_me(e, 0.3):
+                return True
+            if e.hp < 0.3 * max(e.max_hp, 1) and d < 150:
+                return True
+            if self.aimed_at_me(e, 0.12) and d < 120:
+                return True
+        return False
+
+    def hidden_score(self, x, y):
+        w = self.world
+        gz = w.ground_z(x, y)
+        if w.surf_z(x, y) - gz > 0.5:
+            return None
+        c = [x, y, gz + 4.5]
+        tp = [x, y, gz + 9.0]
+        n = v = 0
+        for k in range(8):
+            a = k * PI / 4
+            ca, sa = math.cos(a), math.sin(a)
+            for d in (35.0, 80.0, 150.0):
+                vx, vy = x + ca * d, y + sa * d
+                if not w.inside_bounds(vx, vy, 2):
+                    continue
+                e = [vx, vy, w.surf_z(vx, vy) + 8]
+                n += 1
+                if w.los(e, c) or w.los(e, tp):
+                    v += 1
+        return 1.0 - v / max(n, 1)
+
+    def hide_spot(self, obs, budget_s=0.010):
+        """Incrementally search for a well-hidden ground spot inside the next circle."""
+        if self.world is None:
+            return None
+        z = obs["zone"]
+        nc, nr = z["next_center"], z["next_radius"]
+        key = (round(nc[0]), round(nc[1]), round(nr))
+        px, py = self.pos[0], self.pos[1]
+        lim = max(nr * 0.7, 3.0)
+        h = getattr(self, "hide", None)
+        if h is not None and (h["key"] != key):
+            # keep the old spot if it is still deep inside the new circle
+            if hyp(h["x"] - nc[0], h["y"] - nc[1]) < lim:
+                h["key"] = key
+                h["n"] = 0
+            else:
+                h = None
+        if h is None:
+            h = {"key": key, "x": None, "y": None, "score": -1e9, "n": 0, "hid": 0}
+            self.hide = h
+        t_end = self.t0 + budget_s
+        while time.perf_counter() < t_end and h["n"] < 400:
+            h["n"] += 1
+            a = self.rng.uniform(-PI, PI)
+            r = lim * math.sqrt(self.rng.random())
+            if self.rng.random() < 0.5:
+                # half the samples near us (cheap to reach)
+                cx, cy = px + math.cos(a) * self.rng.uniform(5, 120), py + math.sin(a) * self.rng.uniform(5, 120)
+                if hyp(cx - nc[0], cy - nc[1]) > lim:
+                    continue
+            else:
+                cx, cy = nc[0] + math.cos(a) * r, nc[1] + math.sin(a) * r
+            if not self.world.inside_bounds(cx, cy, 15):
+                continue
+            hs = self.hidden_score(cx, cy)
+            if hs is None:
+                continue
+            sc = hs - hyp(cx - px, cy - py) / 800.0
+            if h["x"] is not None:
+                # current spot re-scored with the same distance penalty
+                cur = h["hid"] - hyp(h["x"] - px, h["y"] - py) / 800.0
+                if sc < cur + 0.08:
+                    continue
+            h.update(x=cx, y=cy, score=sc, hid=hs)
+        if h["x"] is None:
+            return None
+        return (h["x"], h["y"])
 
     def aimed_at_me(self, e, tol=0.16):
         px, py, pz = self.pos
@@ -832,10 +955,31 @@ class Bot:
         self.cover_t = -99
         return self.cover_point_from(srcs, zc, zr)
 
-    def loot_or_hold(self, obs, zc, zr):
+    def loot_or_hold(self, obs, zc, zr, stealth=False):
         t = self.t
         px, py, pz = self.pos
         best, bs, why = None, -1e18, "hold"
+        if stealth:
+            for k, (cat, kind, p, st, hp) in self.items.items():
+                d = hyp(p[0] - px, p[1] - py)
+                if abs(p[2] - pz) > 3 or hyp(p[0] - zc[0], p[1] - zc[1]) > zr * 0.85:
+                    continue
+                if cat == "pickups":
+                    v, _ = self.want_weapon(kind)
+                    if v <= 0 or d > 90:
+                        continue
+                    s_ = 60 * v - d
+                    tag = "loot:" + kind
+                elif cat == "cubes" and d < 60:
+                    s_ = 70 - d
+                    tag = "cube"
+                else:
+                    continue
+                if s_ > bs:
+                    bs, best, why = s_, p, tag
+            if best is None:
+                return None, "hide"
+            return (best[0], best[1]), why
 
         def in_safe(p, m=0.85):
             return hyp(p[0] - zc[0], p[1] - zc[1]) < zr * m
